@@ -11,19 +11,26 @@ use Convert::ASN1 qw(asn_read);
 use Net::LDAP::ASN qw(LDAPRequest LDAPResponse);
 our $VERSION = '0.1';
 use fields qw(socket target);
-use Env qw(BIND_DN BIND_PW LOG_FILE UPSTREAM_LDAP UPSTREAM_SSL);
+use Env qw(BIND_DN BIND_PW LOG_FILE UPSTREAM_LDAP UPSTREAM_SSL LISTEN_SSL LISTEN_SSL_CERT LISTEN_SSL_KEY);
+
+my $config = {
+    listen_addr      => shift @ARGV || '0.0.0.0:389',
+    listen_ssl       => $LISTEN_SSL || 0,
+    listen_ssl_cert  => $LISTEN_SSL_CERT,
+    listen_ssl_key   => $LISTEN_SSL_KEY,
+    upstream_ldap    => $UPSTREAM_LDAP,
+    upstream_ssl     => $UPSTREAM_SSL || 0,
+    bind_dn          => $BIND_DN,
+    bind_pw          => $BIND_PW,
+};
 
 defined $UPSTREAM_LDAP || die "Must set UPSTREAM_LDAP";
 defined $BIND_DN || die "Must set BIND_DN";
 defined $BIND_PW || die "Must set BIND_PW";
-
-my $config = {
-    listen         => shift @ARGV || '0.0.0.0:389',
-    upstream_ldap  => $UPSTREAM_LDAP,
-    upstream_ssl   => $UPSTREAM_SSL || 0,
-    bind_dn        => $BIND_DN,
-    bind_pw        => $BIND_PW,
-};
+if ($config->{listen_ssl}) {
+  defined $LISTEN_SSL_CERT || die "If setting LISTEN_SSL you must set LISTEN_SSL_CERT";
+  defined $LISTEN_SSL_KEY || die "If setting LISTEN_SSL you must set LISTEN_SSL_KEY";
+}
 
 sub handle {
     my $clientsocket = shift;
@@ -63,7 +70,7 @@ sub handle_request {
     if ( defined $request->{bindRequest} ) {
         $request->{bindRequest}->{name} = $config->{bind_dn};
         $request->{bindRequest}->{authentication} = { simple => $config->{bind_pw} };
-    $pdu = $LDAPRequest->encode($request);
+        $pdu = $LDAPRequest->encode($request);
     }
 
     return $pdu;
@@ -121,13 +128,22 @@ sub handle_response {
     return $pdu;
 }
 
-my $listenersock = IO::Socket::INET->new(
-    Listen    => 5,
+our $listenersock;
+if ($config->{listen_ssl}) {
+  $listenersock = IO::Socket::SSL->new(
+    LocalAddr => $config->{listen_addr},
+    Listen => 10,
+    SSL_cert_file => $config->{listen_ssl_cert},
+    SSL_key_file => $config->{listen_ssl_key},
+  ) || die "can't open listen socket: $!";
+} else {
+  $listenersock = IO::Socket::INET->new(
+    LocalAddr => $config->{listen_addr},
+    Listen    => 10,
     Proto     => 'tcp',
     Reuse     => 1,
-    LocalAddr => $config->{listen},
-) || die "can't open listen socket: $!";
-
+  ) || die "can't open listen socket: $!";
+}
 our $server_sock;
 
 sub connect_to_server {
