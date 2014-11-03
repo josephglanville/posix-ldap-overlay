@@ -66,11 +66,14 @@ sub handle_request {
 
     #TODO rewrite requests for uidNumber or gidNumber to objectSid
 
-    # rewrites bind requests to use service account
+    # rewrites anonymous bind requests to use service account
     if ( defined $request->{bindRequest} ) {
-        $request->{bindRequest}->{name} = $config->{bind_dn};
-        $request->{bindRequest}->{authentication} = { simple => $config->{bind_pw} };
-        $pdu = $LDAPRequest->encode($request);
+        my $old = $request->{bindRequest}->{name};
+        if ($old eq "") {
+          $request->{bindRequest}->{name} = $config->{bind_dn};
+          $request->{bindRequest}->{authentication} = { simple => $config->{bind_pw} };
+          $pdu = $LDAPRequest->encode($request);
+        }
     }
 
     return $pdu;
