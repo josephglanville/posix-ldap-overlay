@@ -122,6 +122,9 @@ sub handle_response {
               if ( $attr->{type} eq 'objectSid' ) {
                 push @attrs, { type => 'gidNumber', vals => [ sid2rid($attr->{vals}[0]) ] };
               }
+              if ( $attr->{type} eq 'member' ) {
+                push @attrs, { type => 'uniqueMember', vals => $attr->{vals} };
+              }
             }
           }
           push @{ $response->{protocolOp}->{searchResEntry}->{attributes} }, $_ foreach @attrs;
