@@ -13,10 +13,11 @@ use Net::LDAP::ASN qw(LDAPRequest LDAPResponse);
 use Net::LDAP::Filter qw(Filter);
 our $VERSION = '0.1';
 use fields qw(socket target);
-use Env qw(SID BIND_DN BIND_PW LOG_FILE UPSTREAM_LDAP UPSTREAM_SSL LISTEN_SSL LISTEN_SSL_CERT LISTEN_SSL_KEY);
+use Env qw(KEY_DIR SID BIND_DN BIND_PW LOG_FILE UPSTREAM_LDAP UPSTREAM_SSL LISTEN_SSL LISTEN_SSL_CERT LISTEN_SSL_KEY);
 
 use SID qw(sid2config rid2sid sid2rid sid2string string2sid);
 use Mangle qw(mangleFilter);
+use SSHKey qw(keyExists keyContents);
 
 defined $UPSTREAM_LDAP || die "Must set UPSTREAM_LDAP";
 defined $BIND_DN       || die "Must set BIND_DN";
@@ -40,6 +41,7 @@ my $config = {
     bind_dn         => $BIND_DN,
     bind_pw         => $BIND_PW,
     sid             => sid2config($SID),
+    key_dir         => $KEY_DIR
 };
 
 sub handle_client {
@@ -122,9 +124,6 @@ sub handle_request {
     return $request;
 }
 
-my $ssh_key =
-"ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAxNxII7j9H5cdEM5YYkjRtr9z4AcAD3360UCzRHZfyXm8DkkMmXOrxgkMJOe2CjoOLJKkd4PmEFdULQRbceLFEQwAdckuGKIVnzWz+1IwSZNfNi62jG8qw2UkS5k6HhzZKjHoO85ysFfwSzTbV5ASrTfcfThrilsPE3T0FXWPYqc3iMZ+zIni9A+OHI35LnPuH1912+TnPByONJmAzmWievVnOwvLBjctmQulk/UFESizB5XtE6pfjcoFuFuJDxusJzNq0w8+GykRo5xtEdt4b0whUTwjx5apaWLGr3WxER/EB+4ly7H+SVervpqBVByUYS7qcfq2+mX33EWVJbkysw== joseph\@cloudscaling.com";
-
 sub handle_response {
     my $response = shift;
     if ( defined $response->{protocolOp}->{searchResEntry} ) {
@@ -148,7 +147,10 @@ sub handle_response {
                         push @attrs,
                           { type => 'loginShell', vals => ['/bin/bash'] };
                         # TODO read from file system, check if key exists etc
-                        push @attrs, { type => 'sshPublicKey', vals => [$ssh_key] };
+                        if (keyExists($cn, $config->{key_dir})) {
+                            my $ssh_key = keyContents($cn, $config->{key_dir});
+                            push @attrs, { type => 'sshPublicKey', vals => [$ssh_key] };
+                        }
                     }
                     if ( $attr->{type} eq 'displayName' ) {
                         push @attrs, { type => 'gecos', vals => [ @$values ] };
