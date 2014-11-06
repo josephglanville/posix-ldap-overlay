@@ -1,7 +1,8 @@
 #!/usr/bin/perl
-
-#use strict;
+use strict;
 use warnings;
+use FindBin;
+use lib "$FindBin::Bin/lib";
 
 use IO::Select;
 use IO::Socket;
@@ -12,33 +13,34 @@ use Net::LDAP::ASN qw(LDAPRequest LDAPResponse);
 use Net::LDAP::Filter qw(Filter);
 our $VERSION = '0.1';
 use fields qw(socket target);
-use Env
-  qw(SID BIND_DN BIND_PW LOG_FILE UPSTREAM_LDAP UPSTREAM_SSL LISTEN_SSL LISTEN_SSL_CERT LISTEN_SSL_KEY);
-use Carp;
+use Env qw(SID BIND_DN BIND_PW LOG_FILE UPSTREAM_LDAP UPSTREAM_SSL LISTEN_SSL LISTEN_SSL_CERT LISTEN_SSL_KEY);
+
+use SID qw(sid2config rid2sid sid2rid sid2string string2sid);
+use Mangle qw(mangleFilter);
+
+defined $UPSTREAM_LDAP || die "Must set UPSTREAM_LDAP";
+defined $BIND_DN       || die "Must set BIND_DN";
+defined $BIND_PW       || die "Must set BIND_PW";
+defined $SID           || die "Must set SID";
+if ( $UPSTREAM_SSL ) {
+    defined $LISTEN_SSL_CERT
+      || die "If setting LISTEN_SSL you must set LISTEN_SSL_CERT";
+    defined $LISTEN_SSL_KEY
+      || die "If setting LISTEN_SSL you must set LISTEN_SSL_KEY";
+}
 
 my $config = {
-    listen_addr => shift @ARGV || '0.0.0.0',
-    listen_port => shift @ARGV || 389,
-    listen_ssl  => $LISTEN_SSL || 0,
+    listen_addr     => shift @ARGV || '0.0.0.0',
+    listen_port     => shift @ARGV || 389,
+    listen_ssl      => $LISTEN_SSL || 0,
     listen_ssl_cert => $LISTEN_SSL_CERT,
     listen_ssl_key  => $LISTEN_SSL_KEY,
     upstream_ldap   => $UPSTREAM_LDAP,
     upstream_ssl    => $UPSTREAM_SSL || 0,
     bind_dn         => $BIND_DN,
     bind_pw         => $BIND_PW,
-    sid             => sid2config("$SID"),
+    sid             => sid2config($SID),
 };
-
-defined $UPSTREAM_LDAP || die "Must set UPSTREAM_LDAP";
-defined $BIND_DN       || die "Must set BIND_DN";
-defined $BIND_PW       || die "Must set BIND_PW";
-defined $SID           || die "Must set SID";
-if ( $config->{listen_ssl} ) {
-    defined $LISTEN_SSL_CERT
-      || die "If setting LISTEN_SSL you must set LISTEN_SSL_CERT";
-    defined $LISTEN_SSL_KEY
-      || die "If setting LISTEN_SSL you must set LISTEN_SSL_KEY";
-}
 
 sub handle_client {
     my $client_socket = shift;
@@ -47,10 +49,14 @@ sub handle_client {
     if ( !$reqpdu ) {
         return 0;    # client closed connection
     }
-    $request = handle_request($LDAPRequest->decode($reqpdu));
+    my $request = handle_request($LDAPRequest->decode($reqpdu));
     $reqpdu = $LDAPRequest->encode($request);
 
     print $server_socket $reqpdu || return 0; # couldn't send to server..
+
+    if (defined $request->{abandonRequest}) {
+        return 0;
+    }
 
     my $ready;
     my $sel = IO::Select->new($server_socket);
@@ -59,7 +65,7 @@ sub handle_client {
         if ( !$respdu ) {
             return 0;                             # server closed our connection
         }
-        $response = handle_response($LDAPResponse->decode($respdu));       # mangle response
+        my $response = handle_response($LDAPResponse->decode($respdu));       # mangle response
         $respdu = $LDAPResponse->encode($response);
         print $client_socket $respdu || return 0;  # send res to client
     }
@@ -80,129 +86,40 @@ sub handle_request {
         }
     }
     elsif ( defined $request->{searchRequest} ) {
+        #warn dump($request->{searchRequest}->{filter});
         my $filter = $request->{searchRequest}->{filter};
-        my @new_filter;
         if ( defined $filter->{'and'} ) {
+            my @new_filter;
             foreach my $f ( @{ $filter->{'and'} } ) {
-                if ( defined $f->{equalityMatch} ) {
-                    my $ad = $f->{equalityMatch}->{attributeDesc};
-                    my $v  = $f->{equalityMatch}->{assertionValue};
-                    # Rewrite posixAccount to user
-                    if ( $ad eq 'objectclass' && $v eq 'posixAccount' ) {
-                        push @new_filter,
-                          {
-                            equalityMatch => {
-                                assertionValue => 'user',
-                                attributeDesc => $ad
-                            }
-                          };
-                    }
-                    # Rewrite uid queries to sAMAccountName
-                    elsif ( $ad eq 'uid' ) {
-                        push @new_filter,
-                          {
-                            equalityMatch => {
-                                attributeDesc => 'sAMAccountName',
-                                assertionValue => $v
-                            }
-                          };
-                    }
-                    # Rewrite gidNumber queries to objectSid
-                    elsif ( $ad eq 'gidNumber') {
-                        push @new_filter,
-                        {
-                            equalityMatch => {
-                                attributeDesc => 'objectSid',
-                                assertionValue => rid2sid($v)
-                            }
+                if (defined $f->{'or'}) {
+                    my @or_filter;
+                    foreach my $of ( @{ $f->{'or'} } ) {
+                        $of = mangleFilter($of, $config->{sid});
+                        if (defined $of) {
+                            push @or_filter, $of
                         }
                     }
-                    # Rewrite uidNumber queries to objectSid
-                    elsif ( $ad eq 'uidNumber') {
-                        push @new_filter,
-                        {
-                            equalityMatch => {
-                                attributeDesc => 'objectSid',
-                                assertionValue => rid2sid($v)
-                            }
-                        }
-                    }
-                    elsif ( $ad eq 'objectclass' && $v eq 'ldapPublicKey' ) {
-                        # Black hole, we don't want this to hit AD
-                    }
-                    else {
-                        push @new_filter,
-                          {
-                            equalityMatch => {
-                                assertionValue => $v,
-                                attributeDesc => $ad
-                            }
-                          };
-                    }
+                    push @new_filter, {'or' => \@or_filter}
                 } else {
-                    push @new_filter, $f;
+                    $f = mangleFilter($f, $config->{sid});
+                    if (defined $f) {
+                        push @new_filter, $f
+                    }
                 }
             }
-        $request->{searchRequest}->{filter}->{'and'} = \@new_filter;
+            $request->{searchRequest}->{filter}->{'and'} = \@new_filter;
         }
-        my $f = bless( $request->{searchRequest}->{filter}, 'Net::LDAP::Filter' );
+
+        my $f = bless($request->{searchRequest}->{filter}, 'Net::LDAP::Filter');
         $request->{searchRequest}->{filter} = $f;
+
         # TODO better respect this, currently we need to drop this in order
         # to ensure we are able to rewrite stuff correctly.
         $request->{searchRequest}->{attributes} = [];
+        #warn dump($request->{searchRequest}->{filter});
     }
+    #warn "Mangled request", dump($request);
     return $request;
-}
-
-sub sid2config {
-    my $string = shift;
-    my ( undef, $revision_level, $authority, @sub_authorities ) = split /-/, $string;
-    return {
-        revision_level => $revision_level,
-        authority => $authority,
-        sub_authorities => \@sub_authorities
-    };
-}
-
-sub string2sid {
-    my $string = shift;
-    my ( undef, $revision_level, $authority, @sub_authorities ) = split /-/,
-        $string;
-    my $sub_authority_count = scalar @sub_authorities;
-    my $sid = pack 'C Vxx C V*', $revision_level, $authority,
-        $sub_authority_count, @sub_authorities;
-    return $sid;
-}
-
-sub sid2string {
-    my $sid = @_;
-    my ($revision_level, $authority, $sub_authority_count, @sub_authoritied) =
-      unpack 'C Vxx C V*', $sid;
-    die if $sub_authority_count != scalar @sub_authorities;
-    my $string = join '-', 'S', $revision_level, $authority, @sub_authorities;
-    return $string;
-}
-
-sub sid2rid {
-    my ($sid) = @_;
-    my ( $revision_level, $authority, $sub_authority_count, @sub_authorities ) =
-      unpack 'C Vxx C V*', $sid;
-    #die if $sub_authority_count != scalar @sub_authorities;
-
-    return $sub_authorities[-1];
-}
-
-sub rid2sid {
-    my $rid = shift;
-    my $sub_authorities = $config->{sid}->{sub_authorities};
-    my @sub_authorities = @$sub_authorities;
-    push @sub_authorities, $rid;
-    my $sub_authority_count = scalar @sub_authorities;
-    my $revision_level = $config->{sid}->{revision_level};
-    my $authority = $config->{sid}->{authority};
-    my $sid = pack 'C Vxx C V*', $revision_level, $authority,
-        $sub_authority_count, @sub_authorities;
-    return $sid;
 }
 
 my $ssh_key =
@@ -230,14 +147,11 @@ sub handle_response {
                           { type => 'homeDirectory', vals => ["/home/$cn"] };
                         push @attrs,
                           { type => 'loginShell', vals => ['/bin/bash'] };
-
-                        # TODO inject sshPublicKey here
-                        #if ($cn eq 'ldap-connect') {
-                          push @attrs, { type => 'sshPublicKey', vals => [$ssh_key] };
-                        #}
+                        # TODO read from file system, check if key exists etc
+                        push @attrs, { type => 'sshPublicKey', vals => [$ssh_key] };
                     }
                     if ( $attr->{type} eq 'displayName' ) {
-                        push @attrs, { type => 'gecos', vals => $values };
+                        push @attrs, { type => 'gecos', vals => [ @$values ] };
                     }
                     if ( $attr->{type} eq 'objectSid' ) {
                         push @attrs,
@@ -248,7 +162,7 @@ sub handle_response {
                     }
                     if ( $attr->{type} eq 'primaryGroupID' ) {
                         push @attrs,
-                          { type => 'gidNumber', vals => $values };
+                          { type => 'gidNumber', vals => [ @$values ]};
                     }
                 }
                 if ( "group" ~~ $objectClass ) {
@@ -259,10 +173,10 @@ sub handle_response {
                             vals => [ sid2rid( @$values[0] ) ]
                           };
                     }
-#                    if ( $attr->{type} eq 'member' ) {
-#                        push @attrs,
-#                          { type => 'uniqueMember', vals => $values };
-#                    }
+                    if ( $attr->{type} eq 'member' ) {
+                        push @attrs,
+                          { type => 'uniqueMember', vals => $values };
+                    }
                 }
             }
             push @{ $response->{protocolOp}->{searchResEntry}->{attributes} },
@@ -270,6 +184,7 @@ sub handle_response {
               foreach @attrs;
         }
     }
+    #warn "Mangled response", dump($response);
     return $response
 }
 
@@ -300,10 +215,7 @@ sub create_listener {
 sub connect_to_server {
     my $sock;
     if ( $config->{upstream_ssl} ) {
-        $sock = IO::Socket::SSL->new(
-            PeerAddr => $config->{upstream_ldap},
-            PeerPort => 636
-        );
+        $sock = IO::Socket::SSL->new( $config->{upstream_ldap} . ':636' );
     }
     else {
         $sock = IO::Socket::INET->new(
@@ -320,7 +232,7 @@ sub connect_to_server {
 sub run_proxy {
     print "Starting proxy\n";
     my $listener_sock = create_listener;
-    my $server_sock;
+    my $server_sock; # connect lazily, TODO is this a bad idea?
     my $sel = IO::Select->new($listener_sock);
     while ( my @ready = $sel->can_read ) {
         foreach my $fh (@ready) {
